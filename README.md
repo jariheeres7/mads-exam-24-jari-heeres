@@ -1,4 +1,11 @@
 # MADS-exam-24
+
+## how to use this
+1. clone the repo
+2. change the remote url with `git remote set-url origin <your-repo-url>`
+3. use the pyproject.toml or requirements.lock to install the dependencies
+
+## The case
 The junior datascientist at your work is pretty confident about his knowledge of all the models; He has helped you out by doing some data exploration for you, and he even created two models!
 
 However, he didnt learn to hypertune things, and you are hired as a junior+ datascientist and he has heard you had pretty high grades in the machine learning course.
