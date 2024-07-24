@@ -5,74 +5,64 @@ import ray
 import torch
 from filelock import FileLock
 from loguru import logger
-from mltrainer import ReportTypes, Trainer, TrainerSettings, metrics, rnn_models
-from mltrainer.preprocessors import PaddedPreprocessor
-import numpy as np
+from mltrainer import ReportTypes, Trainer, TrainerSettings
+from mads_datasets.base import BaseDatastreamer
+from mltrainer.preprocessors import BasePreprocessor
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers.hb_bohb import HyperBandForBOHB
 from ray.tune.search.bohb import TuneBOHB
+from src import datasets, models, metrics
 
+# Definitions for shorthand use of tune's sampling methods for hyperparameters
 SAMPLE_INT = tune.search.sample.Integer
 SAMPLE_FLOAT = tune.search.sample.Float
 
-class Accuracy:
-    def __repr__(self) -> str:
-        return "Accuracy"
-
-    def __call__(self, y, yhat):
-        return (np.argmax(yhat, axis=1) == y).sum() / len(yhat)
-
 def train(config: Dict):
     """
-    The train function should receive a config file, which is a Dict
-    ray will modify the values inside the config before it is passed to the train
-    function.
-    """
-    from mads_datasets import DatasetFactoryProvider, DatasetType
+    Train function defines the training process configured to run with Ray Tune,
+    which manages hyperparameter tuning dynamically.
 
+    Parameters:
+    - config (Dict): Dictionary containing configuration parameters and hyperparameters.
+    """
     data_dir = config["data_dir"]
-    gesturesdatasetfactory = DatasetFactoryProvider.create_factory(DatasetType.GESTURES)
-    preprocessor = PaddedPreprocessor()
+    
+    trainfile = data_dir / 'heart_train.parq'
+    testfile = data_dir / 'heart_test.parq'
+    
+    shape = (16, 12)
+    traindataset = datasets.HeartDataset2D(trainfile, target="target", shape=shape)
+    testdataset = datasets.HeartDataset2D(testfile, target="target", shape=shape)
 
     with FileLock(data_dir / ".lock"):
-        # we lock the datadir to avoid parallel instances trying to
-        # access the datadir
-        streamers = gesturesdatasetfactory.create_datastreamer(
-            batchsize=32, preprocessor=preprocessor
-        )
-        train = streamers["train"]
-        valid = streamers["valid"]
+        train = BaseDatastreamer(traindataset, preprocessor=BasePreprocessor(), batchsize=32)
+        valid = BaseDatastreamer(testdataset, preprocessor=BasePreprocessor(), batchsize=32)
 
-    # we set up the metric
-    # and create the model with the config
-    accuracy = Accuracy()
-    model = rnn_models.GRUmodel(config)
+    f1micro = metrics.F1Score(average='micro')
+    f1macro = metrics.F1Score(average='macro')
+    precision = metrics.Precision('micro')
+    recall = metrics.Recall('macro')
+    accuracy = metrics.Accuracy()
+    model = models.CNN(config)
+    model.to("cpu")
 
     trainersettings = TrainerSettings(
-        epochs=50,
-        metrics=[accuracy],
+        epochs=10,
+        metrics=[accuracy, f1micro, f1macro, precision, recall],
         logdir=Path("."),
-        train_steps=len(train),  # type: ignore
-        valid_steps=len(valid),  # type: ignore
+        train_steps=len(train),  
+        valid_steps=len(valid),  
         reporttypes=[ReportTypes.RAY],
-        scheduler_kwargs={"factor": 0.5, "patience": 5},
+        scheduler_kwargs={"factor": 0.5, "patience": 4},
         earlystop_kwargs=None,
     )
-
-    # because we set reporttypes=[ReportTypes.RAY]
-    # the trainloop wont try to report back to tensorboard,
-    # but will report back with ray
-    # this way, ray will know whats going on,
-    # and can start/pause/stop a loop.
-    # This is why we set earlystop_kwargs=None, because we
-    # are handing over this control to ray.
 
     trainer = Trainer(
         model=model,
         settings=trainersettings,
         loss_fn=torch.nn.CrossEntropyLoss(),
-        optimizer=torch.optim.Adam,  # type: ignore
+        optimizer=torch.optim.Adam,
         traindataloader=train.stream(),
         validdataloader=valid.stream(),
         scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau,
@@ -80,29 +70,32 @@ def train(config: Dict):
 
     trainer.loop()
 
-
 if __name__ == "__main__":
     ray.init()
 
-    data_dir = Path("data/raw/gestures/gestures-dataset").resolve()
+    data_dir = Path("data").resolve()
     if not data_dir.exists():
         data_dir.mkdir(parents=True)
         logger.info(f"Created {data_dir}")
     tune_dir = Path("models/ray").resolve()
-
+    
     config = {
-        "input_size": 3,
-        "output_size": 20,
+        "hidden": tune.qrandint(96, 160, 8),
+        "num_layers": tune.choice([1, 2]),
         "tune_dir": tune_dir,
         "data_dir": data_dir,
-        "hidden_size": tune.randint(16, 128),
-        "dropout": tune.uniform(0.0, 0.3),
-        "num_layers": tune.randint(2, 5),
+        "num_classes": 2,
+        "dropout": tune.choice([0.3, 0.4, 0.5]),
+        "shape": (16, 12),
     }
 
     reporter = CLIReporter()
     reporter.add_metric_column("Accuracy")
-
+    reporter.add_metric_column("epochs")
+    reporter.add_metric_column("hidden")
+    reporter.add_metric_column("num_layers")
+    reporter.add_metric_column("dropout")
+    
     bohb_hyperband = HyperBandForBOHB(
         time_attr="training_iteration",
         max_t=50,
@@ -118,7 +111,7 @@ if __name__ == "__main__":
         metric="test_loss",
         mode="min",
         progress_reporter=reporter,
-        local_dir=str(config["tune_dir"]),
+        storage_path=str(tune_dir),
         num_samples=50,
         search_alg=bohb_search,
         scheduler=bohb_hyperband,
